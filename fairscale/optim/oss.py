@@ -49,6 +49,8 @@ class OSS(Optimizer):
             optimizer to shard (default: SGD)
         group (group):
             torch.distributed group (default: group.WORLD)
+        broadcast_buffer_size (int):
+            the size of the buffer used to batch the small parameter tensors (default 8M).
     """
 
     #: The optimizer used for a given shard
@@ -56,14 +58,21 @@ class OSS(Optimizer):
 
     in_super_constructor: bool
 
-    def __init__(self, params: _params_t, optim: Type[Optimizer] = SGD, group: Optional[Any] = None, **default: Any):
+    def __init__(
+        self,
+        params: _params_t,
+        optim: Type[Optimizer] = SGD,
+        group: Optional[Any] = None,
+        broadcast_buffer_size: int = 2 ** 23,
+        **default: Any
+    ):
         # Hold all the model params in the root .param_groups
         self.in_super_constructor = True
         super().__init__(params, default)
         self.in_super_constructor = False
 
         # Partition information. lazy evaluation, computed if requested
-        self._per_device_params: List[List[Parameter]] = []
+        self._per_device_params: List[List[List[Parameter]]] = []  # device, rank, params
         self._param_rank: Dict[torch.Tensor, int] = {}
         self._partition_parameters: List[List[dict]] = []
 
@@ -114,21 +123,26 @@ class OSS(Optimizer):
         return self._partition_parameters
 
     @property
-    def per_device_params(self) -> List[List[Parameter]]:
-        # TODO (Min): The algorithm here can be improved. We are sorting params by device
-        #     and by rank. Then in reduction_fn below, we pack smaller ones into
-        #     a buffer for reduction.
-        #     We can pre-sort them here and simplify the reduction_fn logic below
-        #     since their size shouldn't change.
+    def per_device_params(self) -> List[List[List[Parameter]]]:
+        """Sorted list of all the params, first per device then per rank.
 
+        Within a list params are sorted per number of elements to allow for an easy bucketing.
+        """
         if len(self._per_device_params) == 0:
             for param_group in self.param_groups:
                 param_lists: OrderedDict = OrderedDict()
                 for param in param_group["params"]:
                     device = param.device
                     if param_lists.get(device) is None:
-                        param_lists[device] = []
-                    param_lists[device] += [param]
+                        param_lists[device] = [[] for _ in range(len(self.partition_parameters()))]
+                    param_lists[device][self.param_to_rank[param]] += [param]
+
+            # Sort param_lists by size
+            for k in param_lists.keys():
+                for r in param_lists[k]:
+                    r.sort(key=lambda x: x.numel())
+
+            # Flatten into a list
             self._per_device_params = list(param_lists.values())
 
         return self._per_device_params
@@ -163,22 +177,19 @@ class OSS(Optimizer):
             loss = self.optim.step(**kwargs)
 
         # Sync all the states. Broadcast requests are issued async, we check completeness before moving on
-        requests = []
-        requires_grad = []
-        for rank, param_groups in enumerate(self.partition_parameters()):
-            for param_group in param_groups:
-                for param in param_group["params"]:
-                    # NOTE: Broadcast is in-place and not differentiable
-                    # Gloo will rightly assert on this operation for any tensor that requires grad.
-                    # We save and restore the grad requirement state to work around that, in our case
-                    # the grad is only useful on the source rank.
-                    requires_grad.append((param, param.requires_grad))
-                    param.requires_grad = False
-                    requests.append(dist.broadcast(tensor=param, src=rank, group=self.group, async_op=True))
+        restore_require_grad = []
+        print("step")
 
-        for fut, req_grad in zip(requests, requires_grad):
-            fut.wait()
-            req_grad[0].requires_grad = req_grad[1]
+        for device_params in self.per_device_params:  # all the devices on this rank
+            for rank, rank_params in enumerate(device_params):  # all the params sorted per rank
+                for param in rank_params:
+                    if param.requires_grad:
+                        restore_require_grad.append(param)
+                    param.requires_grad = False  # Gloo workaround
+                    dist.broadcast(tensor=param, src=rank, group=self.group)
+
+        for p in restore_require_grad:
+            p.requires_grad = True
 
         return loss
 
@@ -309,7 +320,10 @@ class OSS(Optimizer):
 
         super().add_param_group(param_group)
         if not self.in_super_constructor:
-            self._partition_parameters.clear()  # Force a re-partitioning
+            # Force a re-partitioning
+            self._partition_parameters.clear()
+            self._per_device_params.clear()
+            self._param_rank.clear()
 
             param_groups = self.partition_parameters()[self.rank]
             if len(param_groups) == len(self.optim.param_groups) + 1:
